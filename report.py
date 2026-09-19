@@ -106,6 +106,53 @@ def status_mark(span: dict) -> str:
     return "✗ FAIL" if span.get("status_code") == 2 else "✓ PASS"
 
 
+def tool_result_failed(result) -> bool:
+    """Detect an application-level tool failure that OTel's span status
+    won't catch on its own -- Goose successfully *dispatched* the tool
+    (span status stays Unset) even when the tool's own result payload
+    represents a failure: a non-zero shell exit code, isError:true either
+    at the top level or nested under "value" (seen when Goose itself
+    rejects/wraps a tool call), etc.
+    """
+    if result is None:
+        return False
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except (ValueError, TypeError):
+            return False  # not JSON -- nothing structured to check
+    if not isinstance(result, dict):
+        return False
+    if result.get("isError") is True:
+        return True
+    if result.get("status") == "error":
+        return True
+    value = result.get("value")
+    if isinstance(value, dict):
+        if value.get("isError") is True:
+            return True
+        exit_code = value.get("structuredContent", {}).get("exit_code")
+        if isinstance(exit_code, int) and exit_code != 0:
+            return True
+    return False
+
+
+def notable_events(span: dict) -> list[dict]:
+    """WARN/ERROR-level span events -- e.g. Rust `tracing::warn!` calls
+    bridged into OTel as span events, such as a JSON-RPC "-32600: Tool
+    'X' was not advertised for this model turn" rejection. These aren't
+    spans of their own, so without this they're captured in storage but
+    never shown in the rendered report. DEBUG-level events (config
+    loading, etc.) are deliberately excluded to avoid drowning the report.
+    """
+    out = []
+    for e in span.get("events", []):
+        level = (e.get("attributes", {}) or {}).get("level")
+        if level in ("WARN", "ERROR"):
+            out.append(e)
+    return out
+
+
 def divider(char="─"):
     return char * WIDTH
 
@@ -144,7 +191,6 @@ def render_report(spans: list[dict]) -> str:
     provider = first_attr(all_attrs, ATTR_CANDIDATES["provider"]) or "unknown"
     agent_name = all_attrs.get("service.name", "Goose")
 
-    ordered = sorted(spans, key=lambda s: s.get("start_ns", 0))
     # trace_output/final answer text lives on the root span, not on the
     # individual model-call span -- attach it to whichever model/tool call
     # actually finishes last (by end time), so it shows on the true final step.
@@ -152,6 +198,18 @@ def render_report(spans: list[dict]) -> str:
     call_end_times = [s.get("end_ns", 0) for s in spans if classify(s["name"]) in call_kinds]
     last_call_end_ns = max(call_end_times) if call_end_times else None
     root_final_answer = first_attr(root.get("attributes", {}), ATTR_CANDIDATES["final_answer"])
+
+    # Build a single chronological timeline mixing spans (by start time) and
+    # any WARN/ERROR span events (by event time) -- including events on
+    # structural spans (reply/reply_stream), since that's where a rejected
+    # tool-call warning is most likely to be attached even though the
+    # containing span itself isn't rendered as its own step.
+    timeline = []
+    for s in spans:
+        timeline.append((s.get("start_ns", 0), "span", s, None))
+        for ev in notable_events(s):
+            timeline.append((ev.get("time_ns", s.get("start_ns", 0)), "event", ev, s["name"]))
+    timeline.sort(key=lambda item: item[0])
 
     lines = []
     lines.append(box())
@@ -173,6 +231,7 @@ def render_report(spans: list[dict]) -> str:
     model_calls = 0
     tool_calls = 0
     failed_tools = 0
+    warnings = 0
     any_error = False
 
     def step_header(title):
@@ -188,7 +247,25 @@ def render_report(spans: list[dict]) -> str:
     lines.append(kv_block("Input", task))
     lines.append("")
 
-    for s in ordered:
+    for _t, item_type, item, span_name in timeline:
+
+        if item_type == "event":
+            warnings += 1
+            any_error = True
+            step_header("⚠ WARNING")
+            lines.append("✗ FAIL")
+            lines.append("")
+            lines.append(kv_block("From span", span_name))
+            lines.append("")
+            lines.append(kv_block("Message", item.get("name", "")))
+            attrs = item.get("attributes", {})
+            if attrs:
+                lines.append("")
+                lines.append(kv_block("Attributes", attrs))
+            lines.append("")
+            continue
+
+        s = item
         kind = classify(s["name"])
         if kind == "structural":
             continue  # reply / reply_stream / session are containers, not steps
@@ -231,22 +308,28 @@ def render_report(spans: list[dict]) -> str:
         elif kind == "tool":
             tool_calls += 1
             tool_name = first_attr(attrs, ATTR_CANDIDATES["tool_name"]) or s["name"]
+            result = first_attr(attrs, ATTR_CANDIDATES["tool_result"])
+            # OTel span status alone misses this: Goose successfully
+            # dispatches a tool whose *own result* represents a failure
+            # (non-zero exit code, isError:true), so span status_code stays
+            # Unset/0. Check the actual payload too.
+            tool_failed = s.get("status_code") == 2 or tool_result_failed(result)
+
             step_header("TOOL EXECUTION")
-            lines.append(status_mark(s))
+            lines.append("✗ FAIL" if tool_failed else "✓ PASS")
             lines.append("")
             lines.append(kv_block("Tool", tool_name))
             args = first_attr(attrs, ATTR_CANDIDATES["tool_args"])
             if args is not None:
                 lines.append("")
                 lines.append(kv_block("Arguments", args))
-            result = first_attr(attrs, ATTR_CANDIDATES["tool_result"])
             if result is not None:
                 lines.append("")
                 lines.append(kv_block("Result", result))
             lines.append("")
             lines.append(kv_block("Duration", f"{dur_s(s):.2f}s"))
             lines.append("")
-            if s.get("status_code") == 2:
+            if tool_failed:
                 failed_tools += 1
                 any_error = True
 
@@ -280,6 +363,7 @@ def render_report(spans: list[dict]) -> str:
     lines.append(f"Model calls:          {model_calls}")
     lines.append(f"Tool calls:           {tool_calls}")
     lines.append(f"Failed tool calls:    {failed_tools}")
+    lines.append(f"Warnings:             {warnings}")
 
     return "\n".join(lines)
 
