@@ -73,6 +73,44 @@ def recent_trace_ids(conn: sqlite3.Connection, limit: int = 20) -> list[str]:
     return [r[0] for r in cur.fetchall()]
 
 
+def resolve_trace_id(conn: sqlite3.Connection, ident: str) -> str | None:
+    """Accept either a real OTel trace_id (hex hash) or a Goose session.id
+    (e.g. "20260919_6", the human-readable name shown as "Run ID" in the
+    report) and return the matching trace_id, or None if nothing matches.
+    """
+    cur = conn.execute("SELECT 1 FROM spans WHERE trace_id = ? LIMIT 1", (ident,))
+    if cur.fetchone():
+        return ident  # it was already a real trace_id
+    cur = conn.execute(
+        "SELECT trace_id, attributes_json FROM spans ORDER BY received_at DESC"
+    )
+    for trace_id, attrs_json in cur.fetchall():
+        attrs = json.loads(attrs_json or "{}")
+        if attrs.get("session.id") == ident:
+            return trace_id
+    return None
+
+
+def list_traces(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    """Summary rows for --list: trace_id, session.id, task text, span count."""
+    trace_ids = recent_trace_ids(conn, limit=limit)
+    out = []
+    for tid in trace_ids:
+        spans = spans_for_trace(conn, tid)
+        all_attrs = {}
+        for s in spans:
+            all_attrs.update(s.get("attributes", {}))
+        task = (all_attrs.get("user_message") or all_attrs.get("trace_input")
+                or all_attrs.get("input") or "")
+        out.append({
+            "trace_id": tid,
+            "session_id": all_attrs.get("session.id"),
+            "span_count": len(spans),
+            "task": (task[:70] + "...") if len(task) > 70 else task,
+        })
+    return out
+
+
 def spans_for_trace(conn: sqlite3.Connection, trace_id: str) -> list[dict]:
     cur = conn.execute(
         "SELECT * FROM spans WHERE trace_id = ? ORDER BY start_ns ASC",

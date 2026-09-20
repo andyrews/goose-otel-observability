@@ -376,8 +376,28 @@ def cmd_raw(trace_id: str | None):
             print("No traces captured yet.")
             return
         trace_id = ids[0]
+    else:
+        resolved = storage.resolve_trace_id(conn, trace_id)
+        if resolved is None:
+            print(f"No trace found matching '{trace_id}' (checked both "
+                  "trace_id and session.id). Run --list to see what's captured.")
+            return
+        trace_id = resolved
     spans = storage.spans_for_trace(conn, trace_id)
     print(json.dumps(spans, indent=2))
+
+
+def cmd_list(limit: int = 20):
+    conn = storage.get_conn()
+    rows = storage.list_traces(conn, limit=limit)
+    if not rows:
+        print("No traces captured yet.")
+        return
+    print(f"{'SESSION ID':<16} {'SPANS':>6}  {'TRACE ID':<20}  TASK")
+    for r in rows:
+        print(f"{str(r['session_id']):<16} {r['span_count']:>6}  "
+              f"{r['trace_id'][:16]:<20}  {r['task']}")
+    print("\nUse either the SESSION ID or the full TRACE ID with --trace.")
 
 
 def cmd_report(trace_id: str | None):
@@ -389,6 +409,13 @@ def cmd_report(trace_id: str | None):
                   "with the receiver running and OTEL env vars set.")
             return
         trace_id = ids[0]
+    else:
+        resolved = storage.resolve_trace_id(conn, trace_id)
+        if resolved is None:
+            print(f"No trace found matching '{trace_id}' (checked both "
+                  "trace_id and session.id). Run --list to see what's captured.")
+            return
+        trace_id = resolved
     spans = storage.spans_for_trace(conn, trace_id)
     print(render_report(spans))
 
@@ -418,14 +445,18 @@ def cmd_watch(quiet_seconds: float = 3.0, poll: float = 1.0):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--trace", help="Trace ID to render (default: most recent)")
+    ap.add_argument("--trace", help="Trace ID or session ID to render (default: most recent)")
     ap.add_argument("--watch", action="store_true",
                      help="Continuously print a report per completed trace")
     ap.add_argument("--raw", action="store_true",
                      help="Dump raw captured spans as JSON instead of a report")
+    ap.add_argument("--list", action="store_true",
+                     help="List recently captured traces (session ID, trace ID, task)")
     args = ap.parse_args()
 
-    if args.watch:
+    if args.list:
+        cmd_list()
+    elif args.watch:
         cmd_watch()
     elif args.raw:
         cmd_raw(args.trace)
